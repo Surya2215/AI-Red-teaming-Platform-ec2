@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environments
+.venv-worker/
+tool-venvs/
+
+# Environment Variables
+.env
+
+# Logs
+*.log
+logs/
+
+# Reports
+reports/
+
+# DeepEval
+.deepeval/
+
+# OS
+.DS_Store

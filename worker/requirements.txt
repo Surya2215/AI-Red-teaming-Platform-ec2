@@ -1,0 +1,18 @@
+celery>=5.4.0
+redis>=5.0.0
+SQLAlchemy>=2.0.35
+asyncpg>=0.30.0
+cryptography>=43.0.0
+pydantic>=2.8.2
+pydantic-settings>=2.4.0
+python-dotenv>=1.0.1
+python-json-logger>=2.0.7
+httpx>=0.27.2
+PyYAML>=6.0.1
+# Needed by core/llm_client.py's Azure OpenAI path (engine/tool_report_generator.py's
+# reporting agent runs inside this worker process, not just the FastAPI process - see
+# worker/tasks.py::analyze_tool_scan_findings). Other providers (openai/anthropic/
+# ollama/aws_bedrock) use httpx directly and don't need these.
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0

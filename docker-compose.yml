@@ -1,0 +1,28 @@
+services:
+  # Task queue for the Tool Scan async pipeline. Only job_id ever goes on this queue -
+  # see worker/tasks.py and engine/tool_scan_jobs.py. Default guest/guest credentials
+  # are fine for local dev (bound to localhost only); the EC2 deployment must set real
+  # RABBITMQ_DEFAULT_USER/PASS since it's reachable beyond localhost there.
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    ports:
+      - "5672:5672"   # AMQP broker
+      - "15672:15672" # management UI (debugging only)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Celery result backend for the Tool Scan async pipeline (worker/celery_app.py).
+  valkey:
+    image: valkey/valkey:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10

@@ -17,4 +17,8 @@ COPY worker /app/worker
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
+RUN groupadd --system celery && useradd --system --gid celery --home /app celery \
+    && chown -R celery:celery /app
+USER celery
+
 CMD ["celery", "-A", "worker.celery_app", "worker", "--loglevel=INFO"]

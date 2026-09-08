@@ -17,6 +17,10 @@ class TargetExecutionError(PlatformError):
     """Raised when a target request fails after retries."""
 
 
+class SSRFBlockedError(TargetExecutionError):
+    """Raised when a target URL resolves to a blocked cloud metadata endpoint."""
+
+
 class DetectorError(PlatformError):
     """Raised when detector execution fails."""
 

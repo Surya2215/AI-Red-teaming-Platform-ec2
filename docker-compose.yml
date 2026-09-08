@@ -1,14 +1,20 @@
 services:
   # Task queue for the Tool Scan async pipeline. Only job_id ever goes on this queue -
-  # see worker/tasks.py and engine/tool_scan_jobs.py. Default guest/guest credentials
-  # are fine for local dev (bound to localhost only); the EC2 deployment must set real
-  # RABBITMQ_DEFAULT_USER/PASS since it's reachable beyond localhost there.
+  # see worker/tasks.py and engine/tool_scan_jobs.py. Credentials are required (no
+  # guest/guest default) and ports are bound to 127.0.0.1 only - the API/worker
+  # processes run on this same EC2 host (outside Compose) and reach these over
+  # loopback, so nothing needs the host port published beyond 127.0.0.1. Set
+  # RABBITMQ_DEFAULT_USER/PASS in .env and keep RABBITMQ_URL (consumed by
+  # worker/celery_app.py) in sync with the same credentials.
   rabbitmq:
     image: rabbitmq:3-management
     restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Set RABBITMQ_DEFAULT_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Set RABBITMQ_DEFAULT_PASS in .env}
     ports:
-      - "5672:5672"   # AMQP broker
-      - "15672:15672" # management UI (debugging only)
+      - "127.0.0.1:5672:5672"   # AMQP broker
+      - "127.0.0.1:15672:15672" # management UI (debugging only)
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -16,13 +22,16 @@ services:
       retries: 10
 
   # Celery result backend for the Tool Scan async pipeline (worker/celery_app.py).
+  # Set VALKEY_PASSWORD in .env and keep VALKEY_URL (redis://:<password>@host:6379/0)
+  # in sync with it.
   valkey:
     image: valkey/valkey:7
     restart: unless-stopped
+    command: ["valkey-server", "--requirepass", "${VALKEY_PASSWORD:?Set VALKEY_PASSWORD in .env}"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
-      test: ["CMD", "valkey-cli", "ping"]
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD:?Set VALKEY_PASSWORD in .env}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 10

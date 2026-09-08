@@ -1,8 +1,10 @@
 """Application configuration loaded from environment and .env files."""
 
+import ipaddress
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from pydantic import Field, SecretStr
@@ -11,6 +13,35 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
+
+# Cloud instance-metadata endpoints only - this platform's core feature is sending
+# requests to operator-specified targets (including locally-hosted models like Ollama
+# on localhost), so the guard deliberately does not block general private/internal
+# ranges, only the well-known metadata services that leak cloud credentials.
+_BLOCKED_METADATA_HOSTS = {"metadata.google.internal", "metadata.goog"}
+_BLOCKED_METADATA_IPS = {"100.100.100.200"}  # Alibaba Cloud metadata
+_BLOCKED_METADATA_NETWORK_V4 = ipaddress.ip_network("169.254.0.0/16")  # AWS/Azure/GCP/DO/Oracle IMDS + AWS ECS
+_BLOCKED_METADATA_NETWORK_V6 = ipaddress.ip_network("fd00:ec2::/64")  # AWS IMDSv2 IPv6
+
+
+def is_safe_target_url(url: str) -> bool:
+    """Reject URLs that resolve to a cloud instance-metadata endpoint."""
+
+    try:
+        host = (urlparse(url).hostname or "").strip().lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host in _BLOCKED_METADATA_HOSTS or host in _BLOCKED_METADATA_IPS:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # Regular DNS hostname, not an IP literal.
+    if isinstance(ip, ipaddress.IPv4Address):
+        return ip not in _BLOCKED_METADATA_NETWORK_V4
+    return ip not in _BLOCKED_METADATA_NETWORK_V6
 
 
 class Settings(BaseSettings):
@@ -28,6 +59,10 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_dir: Path = ROOT_DIR / "logs"
     report_dir: Path = ROOT_DIR / "reports"
+    # Opt-in: when unset, the API stays open (today's default). Set this on any
+    # deployment reachable beyond localhost (this EC2 box binds uvicorn to 0.0.0.0)
+    # to require a matching X-API-Key header on every request - see api.py's middleware.
+    api_key: str = Field(default="", alias="API_KEY")
     garak_python: str = Field(default="", alias="GARAK_PYTHON")
     pyrit_python: str = Field(default="", alias="PYRIT_PYTHON")
     deepteam_python: str = Field(default="", alias="DEEPTEAM_PYTHON")
@@ -78,6 +113,23 @@ class Settings(BaseSettings):
     default_retry_count: int = 2
     safe_prompt_log_chars: int = 600
 
+    # Production user auth/RBAC/audit trail (core/auth.py) - opt-in, same philosophy
+    # as api_key above: unset means today's behavior (no login required) is unchanged,
+    # so upgrading the platform never locks out an existing deployment mid-flight.
+    # Set AUTH_ENABLED=true for any deployment with more than one human operator -
+    # it adds per-user identity (for RBAC and the audit log) on top of, not instead
+    # of, the existing X-API-Key header (still honored for CI/automation clients).
+    auth_enabled: bool = Field(default=False, alias="AUTH_ENABLED")
+    # HMAC-signs session JWTs (core/auth.py's encode/decode_access_token) - required
+    # once auth_enabled is true; generate with:
+    # python -c "import secrets; print(secrets.token_urlsafe(48))"
+    jwt_secret: str = Field(default="", alias="JWT_SECRET")
+    access_token_ttl_minutes: int = Field(default=480, alias="ACCESS_TOKEN_TTL_MINUTES")
+    # Bootstrap admin, created once on startup if the users table is empty - the only
+    # way to get a first login on a fresh deployment (there is no public signup).
+    initial_admin_email: str = Field(default="", alias="INITIAL_ADMIN_EMAIL")
+    initial_admin_password: str = Field(default="", alias="INITIAL_ADMIN_PASSWORD")
+
     @property
     def azure_ready(self) -> bool:
         """Return whether Azure OpenAI credentials are configured."""
@@ -125,4 +177,43 @@ def get_settings() -> Settings:
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     settings.report_dir.mkdir(parents=True, exist_ok=True)
     return settings
+
+
+def enforce_production_auth_guard(settings: Settings) -> None:
+    """Fail fast at startup if a production deployment forgot to turn on any
+    access control at all.
+
+    Both `api_key` and `auth_enabled` are opt-in (see their Field comments above)
+    so that upgrading the platform never locks out an existing deployment
+    mid-flight - but that same opt-in default means a fresh `environment=production`
+    deployment can silently boot with a completely open API (no X-API-Key, no
+    login) if the operator forgets to set either one. This is a standalone,
+    narrowly-scoped check (not baked into get_settings()/Settings itself) so it's
+    easy to call from wherever an app's startup path lives - here that's
+    core/api.py's `@app.on_event("startup")` - and just as easy to port verbatim
+    to a sibling deployment of this platform that wants the same guard.
+
+    Raises RuntimeError (meant to abort startup, not be caught) when
+    settings.environment == "production" and neither settings.api_key nor
+    settings.auth_enabled is set - or when auth_enabled is set but jwt_secret
+    isn't (every login would mint tokens signed with an empty secret). A no-op
+    for every other environment value.
+    """
+
+    if settings.environment.strip().lower() != "production":
+        return
+    if not settings.api_key and not settings.auth_enabled:
+        raise RuntimeError(
+            "Refusing to start: environment=production but neither API_KEY nor "
+            "AUTH_ENABLED is set. This would leave every endpoint on this "
+            "deployment reachable with no authentication at all. Set API_KEY "
+            "(shared-secret X-API-Key header) and/or AUTH_ENABLED=true (per-user "
+            "login) before starting in production."
+        )
+    if settings.auth_enabled and not settings.jwt_secret:
+        raise RuntimeError(
+            "Refusing to start: AUTH_ENABLED is true but JWT_SECRET is not set - "
+            "every login would mint tokens signed with an empty secret. Set "
+            "JWT_SECRET (see core/auth.py's docstring for how to generate one)."
+        )
 

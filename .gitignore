@@ -16,6 +16,13 @@ logs/
 # Reports
 reports/
 
+# Database - was previously committed (database/redteam.db, containing real scan
+# target data including a live AWS hostname) - now untracked. See git history
+# purge notes for removing it from past commits too, not just future ones.
+*.db
+*.sqlite
+*.sqlite3
+
 # DeepEval
 .deepeval/
 

@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.schemas import ScanRequest, ScanResult, ScanStatus, ScenarioResult, TargetConfig
 from database.models import (
     AttackLogRecord,
+    AuditLogRecord,
     DetectorResultRecord,
     ScanFindingRecord,
     ScanJobRecord,
@@ -18,6 +19,7 @@ from database.models import (
     ScanResultRecord,
     ScanTargetRecord,
     TargetRecord,
+    UserRecord,
 )
 
 
@@ -238,3 +240,102 @@ class Repository:
         await self.session.delete(record)
         await self.session.commit()
         return True
+
+    # -- Users (production auth/RBAC - see core/auth.py) ----------------------------
+
+    async def create_user(
+        self, *, email: str, password_hash: str, display_name: str = "", role: str = "member"
+    ) -> UserRecord:
+        record = UserRecord(email=email.strip().lower(), password_hash=password_hash, display_name=display_name, role=role)
+        self.session.add(record)
+        await self.session.commit()
+        return record
+
+    async def get_user_by_email(self, email: str) -> UserRecord | None:
+        result = await self.session.execute(select(UserRecord).where(UserRecord.email == email.strip().lower()))
+        return result.scalar_one_or_none()
+
+    async def get_user(self, user_id: str) -> UserRecord | None:
+        return await self.session.get(UserRecord, user_id)
+
+    async def list_users(self) -> list[UserRecord]:
+        result = await self.session.execute(select(UserRecord).order_by(UserRecord.created_at))
+        return list(result.scalars().all())
+
+    async def count_users(self) -> int:
+        result = await self.session.execute(select(func.count()).select_from(UserRecord))
+        return int(result.scalar_one())
+
+    async def update_user(
+        self,
+        user_id: str,
+        *,
+        display_name: str | None = None,
+        role: str | None = None,
+        is_active: bool | None = None,
+        password_hash: str | None = None,
+    ) -> UserRecord | None:
+        record = await self.session.get(UserRecord, user_id)
+        if record is None:
+            return None
+        if display_name is not None:
+            record.display_name = display_name
+        if role is not None:
+            record.role = role
+        if is_active is not None:
+            record.is_active = is_active
+        if password_hash is not None:
+            record.password_hash = password_hash
+        await self.session.commit()
+        return record
+
+    async def record_login(self, user_id: str) -> None:
+        record = await self.session.get(UserRecord, user_id)
+        if record is not None:
+            record.last_login_at = datetime.now(UTC)
+            await self.session.commit()
+
+    async def delete_user(self, user_id: str) -> bool:
+        record = await self.session.get(UserRecord, user_id)
+        if record is None:
+            return False
+        await self.session.delete(record)
+        await self.session.commit()
+        return True
+
+    # -- Audit log (append-only) -----------------------------------------------------
+
+    async def add_audit_entry(
+        self,
+        *,
+        user_id: str | None,
+        user_email: str,
+        action: str,
+        resource_type: str = "",
+        resource_id: str = "",
+        detail: dict[str, Any] | None = None,
+        ip_address: str = "",
+    ) -> AuditLogRecord:
+        record = AuditLogRecord(
+            user_id=user_id,
+            user_email=user_email,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            detail=detail or {},
+            ip_address=ip_address,
+        )
+        self.session.add(record)
+        await self.session.commit()
+        return record
+
+    async def list_audit_entries(
+        self, *, offset: int = 0, limit: int = 100, action_prefix: str | None = None, user_email: str | None = None
+    ) -> list[AuditLogRecord]:
+        query = select(AuditLogRecord).order_by(AuditLogRecord.created_at.desc())
+        if action_prefix:
+            query = query.where(AuditLogRecord.action.like(f"{action_prefix}%"))
+        if user_email:
+            query = query.where(AuditLogRecord.user_email == user_email)
+        result = await self.session.execute(query.offset(offset).limit(limit))
+        return list(result.scalars().all())

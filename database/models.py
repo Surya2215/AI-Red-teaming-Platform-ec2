@@ -134,6 +134,51 @@ class ScanJobRecord(Base):
     findings: Mapped[list[ScanFindingRecord]] = relationship(back_populates="job", cascade="all, delete-orphan")
 
 
+class UserRecord(Base):
+    """A logged-in platform user. Only exists once AUTH_ENABLED is turned on
+    (core/config.py) - see core/auth.py for password hashing/JWT issuance and the
+    bootstrap-admin flow that creates the first row on startup. Distinct from the
+    legacy X-API-Key middleware (still supported for machine/CI clients) - that
+    grants full access with no identity attached, this grants a role-scoped,
+    attributable identity used for RBAC checks and the audit log below."""
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(200))
+    display_name: Mapped[str] = mapped_column(String(160), default="")
+    # "admin" | "member" | "viewer" - see core/auth.py's ROLE_* constants for what
+    # each can do. Not a DB enum so a new role can be added without a migration.
+    role: Mapped[str] = mapped_column(String(20), default="member", index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AuditLogRecord(Base):
+    """Immutable trail of who did what, for production/multi-user deployments.
+    Rows are append-only (never updated or deleted by the app itself) so this
+    stays a trustworthy record even if a user's account is later disabled.
+    user_email is denormalized (kept even if the user row is later removed) so
+    history remains readable after account deletion."""
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    user_email: Mapped[str] = mapped_column(String(320), default="")
+    # e.g. "login.success", "login.failed", "scan.create", "scan.delete",
+    # "target.update", "user.role_change", "settings.update" - dotted
+    # "<resource>.<verb>" convention, kept free-text so new actions don't need a schema change.
+    action: Mapped[str] = mapped_column(String(80), index=True)
+    resource_type: Mapped[str] = mapped_column(String(40), default="", index=True)
+    resource_id: Mapped[str] = mapped_column(String(160), default="")
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    ip_address: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
+
+
 class ScanFindingRecord(Base):
     __tablename__ = "scan_findings"
 

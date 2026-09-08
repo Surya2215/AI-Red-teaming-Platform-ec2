@@ -1,0 +1,39 @@
+# Dependencies for the API service (core/api.py) on the EC2 host.
+#
+# There is no repo-managed venv for this service today - the API process runs
+# from a venv that lives outside this repo on the Debian EC2 box. This file
+# exists so those deps are at least documented and pip-installable; after
+# editing it, install into whatever venv actually runs `uvicorn core.api:app`
+# on that host, e.g.:
+#   source /path/to/api-venv/bin/activate && pip install -r requirements.txt
+#
+# See worker/requirements.txt for the separate Celery worker process's deps
+# (some packages, e.g. SQLAlchemy/asyncpg/httpx/PyYAML, are duplicated here
+# since the API and worker run in separate venvs on the same host).
+
+python-dotenv>=1.0.1
+pydantic>=2.8.2
+pydantic-settings>=2.4.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+httpx>=0.27.2
+SQLAlchemy>=2.0.35
+asyncpg>=0.30.0
+python-json-logger>=2.0.7
+PyYAML>=6.0.1
+reportlab>=4.2.2
+cryptography>=43.0.0
+celery>=5.4.0
+redis>=5.0.0
+
+# LLM providers (core/llm_client.py / engine/tool_scan.py).
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
+boto3>=1.35.0
+
+# Production user auth/RBAC/audit logging (core/auth.py) - newly added, see
+# core/config.py's AUTH_ENABLED/JWT_SECRET fields. bcrypt hashes passwords,
+# PyJWT signs/verifies session tokens.
+bcrypt>=4.2.0
+PyJWT>=2.9.0

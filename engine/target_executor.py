@@ -12,8 +12,8 @@ from typing import Any
 
 import httpx
 
-from core.config import get_settings
-from core.exceptions import TargetExecutionError
+from core.config import get_settings, is_safe_target_url
+from core.exceptions import SSRFBlockedError, TargetExecutionError
 from core.logging import get_logger
 from core.schemas import AttackPrompt, ScanSettings, TargetConfig, TargetResponse
 
@@ -65,6 +65,9 @@ class TargetExecutor:
 
         if target.url.startswith("mock://"):
             return await self._mock_response(attack_prompt)
+
+        if not is_safe_target_url(target.url):
+            raise SSRFBlockedError(f"Target URL '{target.url}' resolves to a blocked cloud metadata endpoint.")
 
         workflow = self._workflow_config(target)
         if workflow.get("credential_authentication") or workflow.get("start_session") or workflow.get("next_turn"):
@@ -230,6 +233,8 @@ class TargetExecutor:
             try:
                 method = str(step.get("method") or target.method.value).upper()
                 url = str(self._render_template(step.get("url") or target.url, context.get("prompt", ""), context["conversation_id"], context))
+                if not is_safe_target_url(url):
+                    raise SSRFBlockedError(f"Request URL '{url}' resolves to a blocked cloud metadata endpoint.")
                 headers = self._merge_headers(target, step.get("headers"), context)
                 body_template = step.get("body", target.request_template)
                 body = self._render_template(body_template, context.get("prompt", ""), context["conversation_id"], context)

@@ -2,22 +2,42 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, SecretStr
+from starlette.responses import JSONResponse
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.config import ROOT_DIR, get_settings
+from core.auth import (
+    ALL_ROLES,
+    ROLE_ADMIN,
+    ROLE_MEMBER,
+    ROLE_VIEWER,
+    AuthenticatedUser,
+    bootstrap_admin,
+    check_login_rate_limit,
+    create_access_token,
+    decode_access_token,
+    get_current_user,
+    hash_password,
+    record_audit,
+    require_role,
+    require_user,
+    verify_password,
+)
+from core.config import ROOT_DIR, enforce_production_auth_guard, get_settings
 from core.llm_client import AzureOpenAIClient
 from core.schemas import ScanRequest, ScanResult, TargetConfig
 from database.repository import Repository
-from database.session import get_session, init_db
+from database.session import AsyncSessionLocal, get_session, init_db
 from engine.pdf_report import export_pdf, export_tool_scan_pdf, report_file_name, tool_scan_report_file_name
 from engine.report_generator import generate_enterprise_report
 from engine.scan_orchestrator import ScanOrchestrator
@@ -47,6 +67,48 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_AUTH_EXEMPT_PATHS = {"/health", "/docs", "/openapi.json", "/redoc", "/auth/login"}
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    # Opt-in: only enforced once an operator sets API_KEY (see core/config.py). Local
+    # dev with no API_KEY configured stays exactly as open as it is today.
+    # CORS preflight (OPTIONS) is always exempt: browsers send it without any custom
+    # headers (X-API-Key/Authorization included) by spec, so gating it here would
+    # fail the preflight itself and the browser would never even attempt the real
+    # request - surfacing as an opaque "Failed to fetch" with no HTTP status to act on.
+    expected = get_settings().api_key
+    if expected and request.method != "OPTIONS" and request.url.path not in _AUTH_EXEMPT_PATHS:
+        provided = request.headers.get("x-api-key", "")
+        if not hmac.compare_digest(provided, expected):
+            return JSONResponse(status_code=401, content={"detail": "Missing or invalid API key."})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def require_user_auth(request: Request, call_next):
+    # Opt-in via AUTH_ENABLED - unset means today's no-login behavior is unchanged
+    # (core/config.py's auth_enabled docstring). Once on, every request needs EITHER
+    # a valid X-API-Key (unattributed, for CI/automation - checked by the middleware
+    # above, already ran by this point) OR a valid Authorization: Bearer <jwt>
+    # (attributed to a real user, for the web UI and for RBAC/audit-log purposes).
+    # See require_api_key's comment above for why OPTIONS is always exempt.
+    settings = get_settings()
+    if not settings.auth_enabled or request.method == "OPTIONS" or request.url.path in _AUTH_EXEMPT_PATHS:
+        return await call_next(request)
+
+    api_key_ok = bool(settings.api_key) and hmac.compare_digest(request.headers.get("x-api-key", ""), settings.api_key)
+    if api_key_ok:
+        return await call_next(request)
+
+    auth_header = request.headers.get("authorization", "")
+    token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+    if not token or not decode_access_token(token):
+        return JSONResponse(status_code=401, content={"detail": "Sign in required."})
+    return await call_next(request)
+
 
 TARGET_DIR = ROOT_DIR / "targets"
 REPORT_DIR = ROOT_DIR / "reports"
@@ -118,12 +180,214 @@ class RuntimeLLMSettingsRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup() -> None:
+    enforce_production_auth_guard(get_settings())
     await init_db()
+    try:
+        async with AsyncSessionLocal() as session:
+            await bootstrap_admin(session)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("Failed to bootstrap the initial admin user on startup.")
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Production auth: login, current user, user management, audit log
+#  (core/auth.py - opt-in via AUTH_ENABLED, see that module's docstring)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class UserOut(BaseModel):
+    id: str
+    email: str
+    display_name: str
+    role: str
+    is_active: bool
+    created_at: datetime
+    last_login_at: datetime | None = None
+
+    @classmethod
+    def from_record(cls, record) -> "UserOut":
+        return cls(
+            id=record.id,
+            email=record.email,
+            display_name=record.display_name,
+            role=record.role,
+            is_active=record.is_active,
+            created_at=record.created_at,
+            last_login_at=record.last_login_at,
+        )
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    user: UserOut
+
+
+class CreateUserRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=8)
+    display_name: str = ""
+    role: str = ROLE_ADMIN
+
+    @model_validator(mode="after")
+    def _validate_role(self) -> "CreateUserRequest":
+        if self.role not in ALL_ROLES:
+            raise ValueError(f"role must be one of {ALL_ROLES}")
+        return self
+
+
+class UpdateUserRequest(BaseModel):
+    display_name: str | None = None
+    role: str | None = None
+    is_active: bool | None = None
+    password: str | None = Field(default=None, min_length=8)
+
+    @model_validator(mode="after")
+    def _validate_role(self) -> "UpdateUserRequest":
+        if self.role is not None and self.role not in ALL_ROLES:
+            raise ValueError(f"role must be one of {ALL_ROLES}")
+        return self
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+async def login(payload: LoginRequest, request: Request, session: AsyncSession = Depends(get_session)) -> LoginResponse:
+    if not get_settings().auth_enabled:
+        raise HTTPException(status_code=404, detail="User auth is not enabled on this deployment.")
+    client_ip = request.client.host if request.client else ""
+    check_login_rate_limit(f"ip:{client_ip}", f"email:{payload.email.strip().lower()}")
+    repo = Repository(session)
+    record = await repo.get_user_by_email(payload.email)
+    if record is None or not record.is_active or not verify_password(payload.password, record.password_hash):
+        await record_audit(
+            session, user=None, action="login.failed", resource_type="user", resource_id=payload.email.strip().lower(),
+            request=request, unauthenticated_actor=payload.email.strip().lower(),
+        )
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    await repo.record_login(record.id)
+    await record_audit(session, user=AuthenticatedUser(record.id, record.email, record.role), action="login.success", resource_type="user", resource_id=record.id, request=request)
+    token = create_access_token(record)
+    return LoginResponse(access_token=token, user=UserOut.from_record(record))
+
+
+@app.get("/auth/me", response_model=UserOut)
+async def get_me(user: AuthenticatedUser = Depends(require_user), session: AsyncSession = Depends(get_session)) -> UserOut:
+    record = await Repository(session).get_user(user.id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return UserOut.from_record(record)
+
+
+@app.get("/auth/users", response_model=list[UserOut])
+async def list_users(_: AuthenticatedUser = Depends(require_role(ROLE_ADMIN)), session: AsyncSession = Depends(get_session)) -> list[UserOut]:
+    records = await Repository(session).list_users()
+    return [UserOut.from_record(record) for record in records]
+
+
+@app.post("/auth/users", response_model=UserOut)
+async def create_user(
+    payload: CreateUserRequest,
+    request: Request,
+    admin: AuthenticatedUser = Depends(require_role(ROLE_ADMIN)),
+    session: AsyncSession = Depends(get_session),
+) -> UserOut:
+    repo = Repository(session)
+    if await repo.get_user_by_email(payload.email) is not None:
+        raise HTTPException(status_code=409, detail="A user with this email already exists.")
+    record = await repo.create_user(
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        display_name=payload.display_name,
+        role=payload.role,
+    )
+    await record_audit(
+        session, user=admin, action="user.create", resource_type="user", resource_id=record.id,
+        detail={"email": record.email, "role": record.role}, request=request,
+    )
+    return UserOut.from_record(record)
+
+
+@app.patch("/auth/users/{user_id}", response_model=UserOut)
+async def update_user(
+    user_id: str,
+    payload: UpdateUserRequest,
+    request: Request,
+    admin: AuthenticatedUser = Depends(require_role(ROLE_ADMIN)),
+    session: AsyncSession = Depends(get_session),
+) -> UserOut:
+    repo = Repository(session)
+    if payload.role is not None and user_id == admin.id and payload.role != ROLE_ADMIN:
+        raise HTTPException(status_code=400, detail="You cannot remove your own admin role.")
+    if payload.is_active is False and user_id == admin.id:
+        raise HTTPException(status_code=400, detail="You cannot deactivate your own account.")
+    record = await repo.update_user(
+        user_id,
+        display_name=payload.display_name,
+        role=payload.role,
+        is_active=payload.is_active,
+        password_hash=hash_password(payload.password) if payload.password else None,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    await record_audit(
+        session, user=admin, action="user.update", resource_type="user", resource_id=user_id,
+        detail=payload.model_dump(exclude={"password"}, exclude_none=True), request=request,
+    )
+    return UserOut.from_record(record)
+
+
+@app.delete("/auth/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    request: Request,
+    admin: AuthenticatedUser = Depends(require_role(ROLE_ADMIN)),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, object]:
+    if user_id == admin.id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
+    if not await Repository(session).delete_user(user_id):
+        raise HTTPException(status_code=404, detail="User not found.")
+    await record_audit(session, user=admin, action="user.delete", resource_type="user", resource_id=user_id, request=request)
+    return {"deleted": True, "id": user_id}
+
+
+@app.get("/audit-log")
+async def get_audit_log(
+    offset: int = 0,
+    limit: int = 100,
+    action_prefix: str | None = None,
+    user_email: str | None = None,
+    _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN)),
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    limit = max(1, min(500, limit))
+    entries = await Repository(session).list_audit_entries(
+        offset=max(0, offset), limit=limit, action_prefix=action_prefix, user_email=user_email
+    )
+    return [
+        {
+            "id": entry.id,
+            "user_id": entry.user_id,
+            "user_email": entry.user_email,
+            "action": entry.action,
+            "resource_type": entry.resource_type,
+            "resource_id": entry.resource_id,
+            "detail": entry.detail,
+            "ip_address": entry.ip_address,
+            "created_at": entry.created_at.isoformat() if entry.created_at else None,
+        }
+        for entry in entries
+    ]
 
 
 def _safe_stem(value: str) -> str:
@@ -150,7 +414,11 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 
 
 @app.post("/targets")
-async def save_target(target: TargetConfig, session: AsyncSession = Depends(get_session)) -> dict[str, str]:
+async def save_target(
+    target: TargetConfig,
+    session: AsyncSession = Depends(get_session),
+    _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN, ROLE_MEMBER)),
+) -> dict[str, str]:
     await Repository(session).upsert_target(target)
     TARGET_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{_safe_stem(target.name)}.json"
@@ -159,7 +427,12 @@ async def save_target(target: TargetConfig, session: AsyncSession = Depends(get_
 
 
 @app.put("/targets/{filename}")
-async def update_target(filename: str, target: TargetConfig, session: AsyncSession = Depends(get_session)) -> dict[str, str]:
+async def update_target(
+    filename: str,
+    target: TargetConfig,
+    session: AsyncSession = Depends(get_session),
+    _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN, ROLE_MEMBER)),
+) -> dict[str, str]:
     old_path = _safe_json_path(TARGET_DIR, filename)
     await Repository(session).upsert_target(target)
     TARGET_DIR.mkdir(parents=True, exist_ok=True)
@@ -192,7 +465,9 @@ async def get_target(filename: str) -> dict[str, Any]:
 
 
 @app.delete("/targets/{filename}")
-async def delete_target(filename: str) -> dict[str, object]:
+async def delete_target(
+    filename: str, _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN, ROLE_MEMBER))
+) -> dict[str, object]:
     path = _safe_json_path(TARGET_DIR, filename)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Target not found.")
@@ -262,13 +537,19 @@ The target must remain compatible with the scanner:
 
 
 @app.post("/scans", response_model=ScanResult)
-async def run_scan(request: ScanRequest, session: AsyncSession = Depends(get_session)) -> ScanResult:
+async def run_scan(
+    request: ScanRequest,
+    session: AsyncSession = Depends(get_session),
+    _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN, ROLE_MEMBER)),
+) -> ScanResult:
     orchestrator = ScanOrchestrator(repository=Repository(session))
     return await orchestrator.run_scan(request)
 
 
 @app.post("/scans/{scan_id}/cancel")
-async def cancel_scan(scan_id: str) -> dict[str, str]:
+async def cancel_scan(
+    scan_id: str, _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN, ROLE_MEMBER))
+) -> dict[str, str]:
     TargetExecutor.request_cancel(scan_id)
     return {"status": "cancel_requested", "scan_id": scan_id}
 
@@ -280,7 +561,9 @@ async def tool_scan_tools() -> dict[str, Any]:
 
 @app.post("/tool-scans/jobs", response_model=ScanJobSubmitResponse)
 async def create_tool_scan_job(
-    request: ToolScanRequest, session: AsyncSession = Depends(get_session)
+    request: ToolScanRequest,
+    session: AsyncSession = Depends(get_session),
+    _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN, ROLE_MEMBER)),
 ) -> ScanJobSubmitResponse:
     """Queue a Garak/PyRIT/DeepTeam scan for async execution on the Celery worker.
     Returns immediately with a job_id - never blocks on tool execution (replaces the
@@ -319,7 +602,11 @@ async def get_tool_scan_jobs(
 
 
 @app.delete("/tool-scans/jobs/{job_id}")
-async def delete_tool_scan_job(job_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, object]:
+async def delete_tool_scan_job(
+    job_id: str,
+    session: AsyncSession = Depends(get_session),
+    _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN, ROLE_MEMBER)),
+) -> dict[str, object]:
     deleted = await Repository(session).delete_scan_job(job_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Scan job not found.")
@@ -366,7 +653,9 @@ async def get_tool_scan_job_pdf(job_id: str, session: AsyncSession = Depends(get
 
 @app.post("/tool-scans/targets", response_model=ScanTargetResponse)
 async def create_tool_scan_target(
-    request: ScanTargetCreateRequest, session: AsyncSession = Depends(get_session)
+    request: ScanTargetCreateRequest,
+    session: AsyncSession = Depends(get_session),
+    _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN, ROLE_MEMBER)),
 ) -> ScanTargetResponse:
     try:
         return await save_scan_target(request, Repository(session))
@@ -382,7 +671,11 @@ async def get_tool_scan_targets(
 
 
 @app.delete("/tool-scans/targets/{target_id}")
-async def delete_tool_scan_target(target_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, object]:
+async def delete_tool_scan_target(
+    target_id: str,
+    session: AsyncSession = Depends(get_session),
+    _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN, ROLE_MEMBER)),
+) -> dict[str, object]:
     deleted = await Repository(session).delete_scan_target(target_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Scan target not found.")
@@ -408,7 +701,9 @@ async def get_report(filename: str) -> dict[str, Any]:
 
 
 @app.delete("/reports/{filename}")
-async def delete_report(filename: str) -> dict[str, object]:
+async def delete_report(
+    filename: str, _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN, ROLE_MEMBER))
+) -> dict[str, object]:
     path = _safe_json_path(REPORT_DIR, filename)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Report not found.")
@@ -461,7 +756,9 @@ async def runtime_settings() -> dict[str, Any]:
 
 
 @app.put("/settings/runtime")
-async def update_runtime_settings(request: RuntimeLLMSettingsRequest) -> dict[str, Any]:
+async def update_runtime_settings(
+    request: RuntimeLLMSettingsRequest, _: AuthenticatedUser = Depends(require_role(ROLE_ADMIN))
+) -> dict[str, Any]:
     settings = get_settings()
     allowed = {"azure_openai", "aws_bedrock", "ollama", "openai", "huggingface", "anthropic"}
     if request.llm_provider not in allowed:

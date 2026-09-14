@@ -79,10 +79,10 @@ def _with_pyrit_job_label(request: ToolScanRequest, job_id: str) -> ToolScanRequ
     return request.model_copy(update={"pyrit_memory_labels": json.dumps(labels)})
 
 
-async def _load_job(job_id: str) -> tuple[str, dict[str, Any]]:
+async def _load_job(job_id: str) -> tuple[str, str, dict[str, Any]]:
     async with AsyncSessionLocal() as session:
         job = await Repository(session).get_scan_job(job_id)
-        return job.tool_id, job.request_payload
+        return job.tool_id, job.status, job.request_payload
 
 
 async def _mark_running(job_id: str) -> None:
@@ -153,10 +153,31 @@ def _failure_error_message(tool_id: str, result: Any) -> str:
     return "\n".join(parts)
 
 
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
 @celery_app.task(name="run_scan_job")
 def run_scan_job(job_id: str) -> None:
     try:
-        tool_id, payload = _run_async(_load_job(job_id))
+        tool_id, status, payload = _run_async(_load_job(job_id))
+        # Idempotency guard against a stale redelivery of a task whose original
+        # delivery already ran to completion (SEC-014 fix, ported from the main
+        # repo) - a scan that runs longer than the broker's heartbeat tolerance
+        # can get its whole message redelivered by RabbitMQ even with early acks,
+        # because the ack frame itself never got flushed onto a connection the
+        # broker had already decided was dead. Without this guard, a redelivered
+        # message re-executes run_scan_job from scratch - a full second (or
+        # third) real scan subprocess run, silently, for a job the operator
+        # already sees as finished. This only catches the redelivery-after-
+        # completion case (status already terminal); it does not - and can't,
+        # without a per-delivery token - catch a redelivery that lands while the
+        # original attempt is still genuinely running.
+        if status in _TERMINAL_STATUSES:
+            logger.warning(
+                "Skipping redelivered run_scan_job for a job already in a terminal state.",
+                extra={"scan_id": job_id, "status": status},
+            )
+            return
         request = ToolScanRequest.model_validate(_decrypt_payload(payload))
         if tool_id == "pyrit":
             request = _with_pyrit_job_label(request, job_id)

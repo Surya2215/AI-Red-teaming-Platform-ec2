@@ -1,6 +1,7 @@
 """Application configuration loaded from environment and .env files."""
 
 import ipaddress
+import socket
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -24,8 +25,24 @@ _BLOCKED_METADATA_NETWORK_V4 = ipaddress.ip_network("169.254.0.0/16")  # AWS/Azu
 _BLOCKED_METADATA_NETWORK_V6 = ipaddress.ip_network("fd00:ec2::/64")  # AWS IMDSv2 IPv6
 
 
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if str(ip) in _BLOCKED_METADATA_IPS:
+        return True
+    if isinstance(ip, ipaddress.IPv4Address):
+        return ip in _BLOCKED_METADATA_NETWORK_V4
+    return ip in _BLOCKED_METADATA_NETWORK_V6
+
+
 def is_safe_target_url(url: str) -> bool:
-    """Reject URLs that resolve to a cloud instance-metadata endpoint."""
+    """Reject URLs that resolve to a cloud instance-metadata endpoint.
+
+    SEC-006 fix: this previously returned True for any non-IP-literal hostname
+    without resolving it, which meant a DNS name pointed at 169.254.169.254 (or
+    any other blocked metadata address) sailed straight through on this
+    internet-reachable host - closing a gap already fixed in the main repo's
+    version of this function (security-assessment/full-security-assessment.md,
+    SEC-006). Now resolves and checks every address the hostname could actually
+    connect to, matching main."""
 
     try:
         host = (urlparse(url).hostname or "").strip().lower()
@@ -38,10 +55,25 @@ def is_safe_target_url(url: str) -> bool:
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return True  # Regular DNS hostname, not an IP literal.
-    if isinstance(ip, ipaddress.IPv4Address):
-        return ip not in _BLOCKED_METADATA_NETWORK_V4
-    return ip not in _BLOCKED_METADATA_NETWORK_V6
+        # Not an IP literal - resolve it and check every address it could actually
+        # connect to. A bare hostname-string check alone is bypassable by pointing
+        # a DNS name straight at a metadata IP (rebinding, or just an A record),
+        # since the request library resolves and connects to the *address*, not
+        # the name we validated here.
+        try:
+            resolved = socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            return True  # Unresolvable - not something this guard can evaluate;
+            # the outbound request will simply fail with its own DNS error.
+        for _family, _type, _proto, _canonname, sockaddr in resolved:
+            try:
+                candidate = ipaddress.ip_address(sockaddr[0])
+            except ValueError:
+                continue
+            if _is_blocked_ip(candidate):
+                return False
+        return True
+    return not _is_blocked_ip(ip)
 
 
 class Settings(BaseSettings):

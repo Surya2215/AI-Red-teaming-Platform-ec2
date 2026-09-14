@@ -27,9 +27,9 @@ celery>=5.4.0
 redis>=5.0.0
 
 # LLM providers (core/llm_client.py / engine/tool_scan.py).
-langchain>=0.3.0
-langchain-openai>=0.2.0
-langchain-core>=0.3.0
+langchain>=1.3.11
+langchain-openai>=1.3.3
+langchain-core>=1.4.8
 boto3>=1.35.0
 
 # Production user auth/RBAC/audit logging (core/auth.py) - newly added, see

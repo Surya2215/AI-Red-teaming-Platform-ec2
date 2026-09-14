@@ -13,6 +13,6 @@ PyYAML>=6.0.1
 # reporting agent runs inside this worker process, not just the FastAPI process - see
 # worker/tasks.py::analyze_tool_scan_findings). Other providers (openai/anthropic/
 # ollama/aws_bedrock) use httpx directly and don't need these.
-langchain>=0.3.0
-langchain-openai>=0.2.0
-langchain-core>=0.3.0
+langchain>=1.3.11
+langchain-openai>=1.3.3
+langchain-core>=1.4.8

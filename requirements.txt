@@ -36,4 +36,9 @@ boto3>=1.35.0
 # core/config.py's AUTH_ENABLED/JWT_SECRET fields. bcrypt hashes passwords,
 # PyJWT signs/verifies session tokens.
 bcrypt>=4.2.0
-PyJWT>=2.9.0
+PyJWT>=2.15.0
+
+# Security floors for shared transitive dependencies (2026-10-29 scan).
+certifi>=2026.10.19
+langgraph>=1.2.14
+langgraph-sdk>=0.4.6
